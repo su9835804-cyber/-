@@ -1,0 +1,94 @@
+# .github/workflows/task.yml
+# Workflow 的名稱
+name: 每天讓 GEMINI 生成一段名言佳句
+
+# 觸發 Workflow 的條件
+on:
+  workflow_dispatch: # 允許手動觸發 (可自訂輸入內容，但這裡暫時只處理手動觸發)
+  schedule:
+    # 每天 UTC 時間 01:30 執行 (換算成台灣時間是早上 09:30)
+    # Cron 語法為： 分 | 時 | 日期 | 月份 | 星期幾
+    - cron: '30 01 * * *'
+
+# 工作內容 > 基於 ubuntu(linux) 執行 run-gemini-cli 
+jobs:
+  run-gemini-cli:
+    runs-on: ubuntu-latest
+    permissions:
+      # 為了 commit 和 push 變更，需要 'write' 權限
+      contents: write 
+    steps:
+      # 步驟 1: 將專案檔案 (例如 content.json) checkout 到執行環境
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 步驟 2-1: 設定 Node.js v20 環境 (Gemini CLI 依賴 Node.js)
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          # 由於只用於執行 CLI，不需要快取 npm
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json' 
+
+      # 步驟 2-2: 全域安裝最新版的 @google/gemini-cli
+      - name: Install Gemini CLI globally
+        # 使用 -g 確保 gemini 命令在整個環境中可用
+        run: npm install -g @google/gemini-cli@latest
+        
+      # 步驟 3: 執行 Gemini CLI 並處理 JSON 檔案
+      - name: Run Gemini and Update JSON
+        env:
+          # ❗️❗️❗️ 重要：請確保您在 GitHub Secrets 中建立的 Secret 名稱是 GEMINICLI_KEY
+          # Gemini CLI 會自動讀取 GEMINI_API_KEY 這個環境變數
+          GEMINI_API_KEY: ${{ secrets.GEMINICLI_KEY }}
+        run: |
+          # 🎯 A. 取得台北時區的當前日期與時間
+          CURRENT_DATE=$(TZ="Asia/Taipei" date +'%Y-%m-%d %H:%M:%S')
+          echo "當前台北時間: ${CURRENT_DATE}"
+
+          # 🎯 B. 詢問 geminicli 指令取得名言
+          # 使用 `gemini /ask` 指令，並透過 `| tail -n +2` 移除 CLI 的 Banner/Prompt 行，確保只取得結果。
+          # 調整 Prompt 以獲得純文字輸出，避免 Markdown 符號干擾 JSON
+          POEM=$(gemini /ask "給我一句簡短、激勵人心的中文名言佳句或詩詞，不要換行，不要包含任何標題、編號或 Markdown 符號 (例如 * 或 #)，只給出名言佳句的內容本身。" | tail -n +2 | tr -d '\n' | sed 's/"/\\"/g' | awk '{$1=$1};1')
+
+          echo "Gemini 生成內容: ${POEM}"
+          
+          # 🎯 C. 檢查是否有可讀寫的名言檔案 (content.json)，沒有的話就新建一個空陣列
+          # 檢查檔案是否存在，或內容是否為空 (例如只有換行符)
+          if [ ! -s content.json ] || [ "$(cat content.json | tr -d '[:space:]')" == "" ]; then
+              echo "[]" > content.json
+              echo "content.json 不存在或為空，已建立新的空陣列。"
+          fi
+
+          # 🎯 D. 建立新的資料物件並寫入到 content.json 中
+          # 建立新的 JSON 物件
+          NEW_DATA='{"date": "'"${CURRENT_DATE}"'", "poem": "'"${POEM}"'"}'
+          
+          # 透過 jq 工具將新資料加入到現有 JSON 陣列的開頭 (最前面)
+          # jq 工具在 ubuntu-latest 環境中通常已經預裝
+          jq --argjson new_data "${NEW_DATA}" '. | [ $new_data ] + .' content.json > tmp.json && mv tmp.json content.json
+
+          echo "已將新資料寫入 content.json。"
+      
+      # 步驟 4: Commit 並 Push 更新後的 JSON 檔案
+      - name: Commit and Push changes
+        run: |
+          # 配置 git 使用者，讓 Commit 標示為 bot 執行
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          
+          # 只 add content.json 這個檔案
+          git add content.json
+
+          # 檢查是否有檔案變更，如果有才執行 commit 和 push
+          if ! git diff --staged --quiet; then
+            # 在 commit message 中加入日期，方便追蹤
+            COMMIT_DATE=$(TZ="Asia/Taipei" date +'%Y-%m-%d')
+            git commit -m "feat(bot): ✨ 新增 ${COMMIT_DATE} 的名言佳句"
+            
+            # 使用 --force-with-lease 避免覆寫他人 commit
+            git push
+          else
+            echo "content.json 沒有變更，無需 commit。"
+          fi
